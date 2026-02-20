@@ -1,5 +1,6 @@
 package com.infobip.kafkistry.api
 
+import com.fasterxml.jackson.annotation.JsonInclude
 import com.infobip.kafkistry.appinfo.ModulesBuildInfoLoader
 import com.infobip.kafkistry.kafka.KafkaAclRule
 import com.infobip.kafkistry.kafka.Partition
@@ -211,7 +212,9 @@ class McpApi(
         val desc = topicsRegistryService.getTopic(topicName)
         return RegistryTopicPresence(
             name = desc.name,
-            presence = desc.presence
+            presenceType = desc.presence.type.name,
+            kafkaClusterIdentifiers = desc.presence.kafkaClusterIdentifiers,
+            tag = desc.presence.tag
         )
     }
 
@@ -445,11 +448,16 @@ class McpApi(
      * It does not return issue details — use /inspect/topic/{topicName}/status for the list of
      * specific status types, or /inspect/topic/{topicName}/config for configuration diff details.
      *
+     * By default (`problemsOnly=true`) only topics with at least one issue are returned,
+     * which is the typical use case for fleet scanning. Pass `problemsOnly=false` to include
+     * healthy topics as well.
+     *
      * The optional `clustersOnly` parameter accepts comma-separated cluster identifiers
      * to limit the per-cluster breakdown to specific clusters.
      *
-     * Supports pagination via `limit` and `offset` parameters.
+     * Supports pagination via `limit` and `offset` parameters (applied after filtering).
      *
+     * @param problemsOnly When true (default), only topics where overallOk=false are returned
      * @param limit Maximum number of topics to return
      * @param offset Number of topics to skip for pagination
      * @param clustersOnly Comma-separated cluster identifiers to filter by (optional)
@@ -457,6 +465,7 @@ class McpApi(
      */
     @GetMapping("/inspect/topics/status-summary")
     fun inspectTopicsStatusSummary(
+        @RequestParam("problemsOnly", required = false, defaultValue = "true") problemsOnly: Boolean,
         @RequestParam("limit", required = false) limit: Int?,
         @RequestParam("offset", required = false, defaultValue = "0") offset: Int,
         @RequestParam("clustersOnly", required = false) clustersOnly: String?
@@ -464,24 +473,24 @@ class McpApi(
         val allTopics = topicsInspectionService.inspectAllTopics()
         val clusterIds = clustersOnly?.split(",")?.toSet()
 
-        val summaries = allTopics.map { topic ->
-            val filteredClusters = if (clusterIds != null) {
-                topic.statusPerClusters.filter { it.clusterIdentifier in clusterIds }
-            } else {
-                topic.statusPerClusters
+        val summaries = allTopics
+            .filter { topic -> !problemsOnly || !topic.aggStatusFlags.allOk }
+            .map { topic ->
+                var clusters = topic.statusPerClusters
+                if (clusterIds != null) clusters = clusters.filter { it.clusterIdentifier in clusterIds }
+                if (problemsOnly) clusters = clusters.filter { !it.status.flags.allOk }
+                TopicStatusSummary(
+                    topicName = topic.topicName,
+                    overallOk = topic.aggStatusFlags.allOk,
+                    clusterStatuses = clusters.map { cluster ->
+                        ClusterStatusSummary(
+                            clusterIdentifier = cluster.clusterIdentifier,
+                            ok = cluster.status.flags.allOk,
+                            issueCount = cluster.status.types.size
+                        )
+                    }
+                )
             }
-            TopicStatusSummary(
-                topicName = topic.topicName,
-                overallOk = topic.aggStatusFlags.allOk,
-                clusterStatuses = filteredClusters.map { cluster ->
-                    ClusterStatusSummary(
-                        clusterIdentifier = cluster.clusterIdentifier,
-                        ok = cluster.status.flags.allOk,
-                        issueCount = cluster.status.types.size
-                    )
-                }
-            )
-        }
 
         return applyPagination(summaries, limit, offset)
     }
@@ -507,18 +516,22 @@ class McpApi(
      * that differ, use /inspect/topic/{topicName}/config.
      *
      * @param topicName Topic name
+     * @param clustersOnly Comma-separated cluster identifiers to restrict results to (optional)
      * @return Status flags, issue type codes, and available actions per cluster
      */
     @GetMapping("/inspect/topic/{topicName}/status")
     fun inspectTopicStatus(
-        @PathVariable topicName: TopicName
+        @PathVariable topicName: TopicName,
+        @RequestParam("clustersOnly", required = false) clustersOnly: String?
     ): TopicStatusInfo {
         val topicStatus = topicsInspectionService.inspectTopic(topicName)
+        val clusterIds = clustersOnly?.split(",")?.toSet()
+        val clusters = if (clusterIds != null) topicStatus.statusPerClusters.filter { it.clusterIdentifier in clusterIds } else topicStatus.statusPerClusters
         return TopicStatusInfo(
             topicName = topicStatus.topicName,
             aggStatusFlags = topicStatus.aggStatusFlags,
             availableActions = topicStatus.availableActions,
-            clusterStatuses = topicStatus.statusPerClusters.map {
+            clusterStatuses = clusters.map {
                 TopicClusterStatusInfo(
                     clusterIdentifier = it.clusterIdentifier,
                     flags = it.status.flags,
@@ -548,16 +561,20 @@ class McpApi(
      * that are out of alignment.
      *
      * @param topicName Topic name
+     * @param clustersOnly Comma-separated cluster identifiers to restrict results to (optional)
      * @return Per-cluster configuration diffs and rule violations
      */
     @GetMapping("/inspect/topic/{topicName}/config")
     fun inspectTopicConfig(
-        @PathVariable topicName: TopicName
+        @PathVariable topicName: TopicName,
+        @RequestParam("clustersOnly", required = false) clustersOnly: String?
     ): TopicInspectConfigInfo {
         val topicStatus = topicsInspectionService.inspectTopic(topicName)
+        val clusterIds = clustersOnly?.split(",")?.toSet()
+        val clusters = if (clusterIds != null) topicStatus.statusPerClusters.filter { it.clusterIdentifier in clusterIds } else topicStatus.statusPerClusters
         return TopicInspectConfigInfo(
             topicName = topicStatus.topicName,
-            clusterConfigIssues = topicStatus.statusPerClusters.map {
+            clusterConfigIssues = clusters.map {
                 ClusterConfigIssues(
                     clusterIdentifier = it.clusterIdentifier,
                     wrongValues = it.status.wrongValues ?: emptyList(),
@@ -622,17 +639,21 @@ class McpApi(
      * health, and monitoring ongoing reassignment operations.
      *
      * @param topicName Topic name
+     * @param clustersOnly Comma-separated cluster identifiers to restrict results to (optional)
      * @return Partition assignments, replica states, and rebalancing info per cluster
      */
     @GetMapping("/inspect/topic/{topicName}/assignments")
     fun inspectTopicAssignments(
-        @PathVariable topicName: TopicName
+        @PathVariable topicName: TopicName,
+        @RequestParam("clustersOnly", required = false) clustersOnly: String?
     ): TopicAssignmentInfo {
         val topicStatus = topicsInspectionService.inspectTopic(topicName)
+        val clusterIds = clustersOnly?.split(",")?.toSet()
         return TopicAssignmentInfo(
             topicName = topicStatus.topicName,
             clusterAssignments = topicStatus.statusPerClusters
                 .filter { it.existingTopicInfo != null }
+                .filter { clusterIds == null || it.clusterIdentifier in clusterIds }
                 .associate { cluster ->
                     cluster.clusterIdentifier to ClusterAssignmentDetails(
                         existingTopicInfo = cluster.existingTopicInfo!!,
@@ -662,18 +683,22 @@ class McpApi(
      * configuration changes, or to identify topics with unexpectedly high resource footprints.
      *
      * @param topicName Topic name
+     * @param clustersOnly Comma-separated cluster identifiers to restrict results to (optional)
      * @return Registry resource requirements and actual per-cluster resource usage metrics
      */
     @GetMapping("/inspect/topic/{topicName}/resources")
     fun inspectTopicResources(
-        @PathVariable topicName: TopicName
+        @PathVariable topicName: TopicName,
+        @RequestParam("clustersOnly", required = false) clustersOnly: String?
     ): TopicResourceInfo {
         val topicStatus = topicsInspectionService.inspectTopic(topicName)
+        val clusterIds = clustersOnly?.split(",")?.toSet()
         return TopicResourceInfo(
             topicName = topicStatus.topicName,
             resourceRequirements = topicStatus.topicDescription?.resourceRequirements,
             clusterResources = topicStatus.statusPerClusters
                 .filter { it.resourceRequiredUsages.value != null }
+                .filter { clusterIds == null || it.clusterIdentifier in clusterIds }
                 .associate { it.clusterIdentifier to it.resourceRequiredUsages.value!! }
         )
     }
@@ -1226,9 +1251,12 @@ data class RegistryTopicConfig(
  * Topic presence configuration from registry.
  * Returned by: GET /registry/topic/{name}/presence
  */
+@JsonInclude(JsonInclude.Include.NON_NULL)
 data class RegistryTopicPresence(
     val name: TopicName,
-    val presence: Presence
+    val presenceType: String,
+    val kafkaClusterIdentifiers: List<KafkaClusterIdentifier>?,
+    val tag: Tag?
 )
 
 /**

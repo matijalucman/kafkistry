@@ -5,33 +5,24 @@ import com.infobip.kafkistry.appinfo.ModulesBuildInfoLoader
 import com.infobip.kafkistry.kafka.KafkaAclRule
 import com.infobip.kafkistry.kafka.Partition
 import com.infobip.kafkistry.kafka.TopicPartitionReAssignment
-import com.infobip.kafkistry.kafkastate.TopicReplicaInfos
 import com.infobip.kafkistry.model.*
-import com.infobip.kafkistry.model.Presence
-import com.infobip.kafkistry.model.ResourceRequirements
-import com.infobip.kafkistry.model.TopicConfigMap
-import com.infobip.kafkistry.model.TopicProperties
-import com.infobip.kafkistry.service.NamedTypeCauseDescription
-import com.infobip.kafkistry.service.NamedTypeQuantity
 import com.infobip.kafkistry.service.OptionalValue
 import com.infobip.kafkistry.service.acl.AclsRegistryService
 import com.infobip.kafkistry.service.background.BackgroundJobIssuesRegistry
-import com.infobip.kafkistry.service.cluster.ClustersRegistryService
 import com.infobip.kafkistry.service.cluster.ClusterStatusService
+import com.infobip.kafkistry.service.cluster.ClustersRegistryService
 import com.infobip.kafkistry.service.consumers.ConsumersService
 import com.infobip.kafkistry.service.consumers.TopicMembers
+import com.infobip.kafkistry.service.generator.AssignmentsDisbalance
 import com.infobip.kafkistry.service.history.HistoryService
 import com.infobip.kafkistry.service.quotas.QuotasRegistryService
-import com.infobip.kafkistry.service.generator.AssignmentsDisbalance
-import com.infobip.kafkistry.service.resources.BrokerDisk
-import com.infobip.kafkistry.service.resources.ClusterResourcesAnalyzer
-import com.infobip.kafkistry.service.resources.TopicClusterDiskUsage
-import com.infobip.kafkistry.service.resources.TopicResourceRequiredUsages
-import com.infobip.kafkistry.service.resources.TopicResourcesAnalyzer
-import com.infobip.kafkistry.service.resources.UsageLevel
+import com.infobip.kafkistry.service.resources.*
 import com.infobip.kafkistry.service.scrapingstatus.ScrapingStatusService
 import com.infobip.kafkistry.service.topic.*
+import com.infobip.kafkistry.sql.QueryExample
 import com.infobip.kafkistry.sql.SQLRepository
+import com.infobip.kafkistry.sql.TableInfo
+import com.infobip.kafkistry.sql.TableStats
 import org.springframework.web.bind.annotation.*
 
 /**
@@ -92,13 +83,15 @@ class McpApi(
     /**
      * Lists all topics from the registry with ownership and presence metadata.
      *
-     * Each entry includes: topic name, owner (team/service responsible for the topic),
+     * Each entry includes: topic name, owner (team/service responsible for the topic), and
      * presence type (which determines on which clusters the topic should exist — e.g., ALL_CLUSTERS,
-     * INCLUDED_CLUSTERS, EXCLUDED_CLUSTERS, or TAGGED_CLUSTERS), and labels (arbitrary key-value
-     * tags assigned to the topic for categorization or filtering).
+     * INCLUDED_CLUSTERS, EXCLUDED_CLUSTERS, or TAGGED_CLUSTERS).
+     *
+     * Labels are intentionally excluded to keep the response compact. Use /registry/topic/{name}/info
+     * to fetch labels for a specific topic.
      *
      * This endpoint is the preferred starting point when you need to browse or search topics
-     * by ownership, cluster targeting strategy, or labels without loading full configuration details.
+     * by ownership or cluster targeting strategy without loading full configuration details.
      *
      * Supports pagination via `limit` and `offset` parameters.
      *
@@ -116,8 +109,7 @@ class McpApi(
             RegistryTopicSummary(
                 name = topic.name,
                 owner = topic.owner,
-                presenceType = topic.presence.type.name,
-                labels = topic.labels
+                presenceType = topic.presence.type.name
             )
         }
     }
@@ -434,65 +426,6 @@ class McpApi(
                 )
             }
         )
-    }
-
-    /**
-     * Returns a compact health summary across all topics and clusters.
-     *
-     * For each topic, the response provides:
-     * - topicName: the topic name
-     * - overallOk: whether the topic has no issues on any cluster
-     * - clusterStatuses: per-cluster breakdown with an ok flag and a count of active issue types
-     *
-     * This endpoint is the most efficient way to scan the full fleet of topics for problems.
-     * It does not return issue details — use /inspect/topic/{topicName}/status for the list of
-     * specific status types, or /inspect/topic/{topicName}/config for configuration diff details.
-     *
-     * By default (`problemsOnly=true`) only topics with at least one issue are returned,
-     * which is the typical use case for fleet scanning. Pass `problemsOnly=false` to include
-     * healthy topics as well.
-     *
-     * The optional `clustersOnly` parameter accepts comma-separated cluster identifiers
-     * to limit the per-cluster breakdown to specific clusters.
-     *
-     * Supports pagination via `limit` and `offset` parameters (applied after filtering).
-     *
-     * @param problemsOnly When true (default), only topics where overallOk=false are returned
-     * @param limit Maximum number of topics to return
-     * @param offset Number of topics to skip for pagination
-     * @param clustersOnly Comma-separated cluster identifiers to filter by (optional)
-     * @return List of per-topic health summaries
-     */
-    @GetMapping("/inspect/topics/status-summary")
-    fun inspectTopicsStatusSummary(
-        @RequestParam("problemsOnly", required = false, defaultValue = "true") problemsOnly: Boolean,
-        @RequestParam("limit", required = false) limit: Int?,
-        @RequestParam("offset", required = false, defaultValue = "0") offset: Int,
-        @RequestParam("clustersOnly", required = false) clustersOnly: String?
-    ): List<TopicStatusSummary> {
-        val allTopics = topicsInspectionService.inspectAllTopics()
-        val clusterIds = clustersOnly?.split(",")?.toSet()
-
-        val summaries = allTopics
-            .filter { topic -> !problemsOnly || !topic.aggStatusFlags.allOk }
-            .map { topic ->
-                var clusters = topic.statusPerClusters
-                if (clusterIds != null) clusters = clusters.filter { it.clusterIdentifier in clusterIds }
-                if (problemsOnly) clusters = clusters.filter { !it.status.flags.allOk }
-                TopicStatusSummary(
-                    topicName = topic.topicName,
-                    overallOk = topic.aggStatusFlags.allOk,
-                    clusterStatuses = clusters.map { cluster ->
-                        ClusterStatusSummary(
-                            clusterIdentifier = cluster.clusterIdentifier,
-                            ok = cluster.status.flags.allOk,
-                            issueCount = cluster.status.types.size
-                        )
-                    }
-                )
-            }
-
-        return applyPagination(summaries, limit, offset)
     }
 
     /**
@@ -1058,6 +991,102 @@ class McpApi(
     }
 
     /**
+     * Returns summaries of all consumer groups consuming a specific topic.
+     *
+     * Use this endpoint to discover which consumer groups are reading from a given topic,
+     * optionally scoped to a single cluster. Each entry in the response represents one
+     * consumer group on one cluster and includes:
+     * - groupId: the consumer group identifier
+     * - clusterIdentifier: the cluster this group was observed on
+     * - status: the current group state (e.g., Stable, Empty, Dead)
+     * - lagAmount: total unconsumed messages across all partitions of this topic for this group.
+     *   May be null if offsets could not be fetched.
+     * - lagStatus: severity classification of the lag (e.g., OK, WARNING, CRITICAL)
+     * - partitionAssignor: the partition assignment strategy in use
+     * - topics: all topics this group consumes (not just the filtered one)
+     *
+     * When clusterIdentifier is omitted, all registered clusters are queried.
+     *
+     * Use /inspect/consumers/by-topic/lag to get a lag-focused view sorted by lag amount.
+     *
+     * @param topicName Topic name to filter by (required)
+     * @param clusterIdentifier Optional cluster identifier to restrict results to a single cluster
+     * @return List of consumer group summaries consuming the given topic
+     */
+    @GetMapping("/inspect/consumers/by-topic")
+    fun inspectConsumersByTopic(
+        @RequestParam("topicName") topicName: TopicName,
+        @RequestParam("clusterIdentifier", required = false) clusterIdentifier: KafkaClusterIdentifier?
+    ): List<TopicConsumerGroupSummary> {
+        val clusterIds = if (clusterIdentifier != null) {
+            listOf(clusterIdentifier)
+        } else {
+            clustersRegistryService.listClusters().map { it.identifier }
+        }
+        return clusterIds.flatMap { clusterId ->
+            consumersService.clusterTopicConsumers(clusterId, topicName).map { group ->
+                TopicConsumerGroupSummary(
+                    groupId = group.groupId,
+                    clusterIdentifier = clusterId,
+                    status = group.status.name,
+                    lagAmount = group.lag.amount,
+                    lagStatus = group.lag.status.name,
+                    partitionAssignor = group.partitionAssignor,
+                    topics = group.topicMembers.map { it.topicName }
+                )
+            }
+        }
+    }
+
+    /**
+     * Returns lag information for all consumer groups consuming a specific topic, across clusters.
+     *
+     * This endpoint is optimized for the use case of finding which consumer group has the
+     * biggest lag on a given topic. Results include per-topic lag broken down to the requested
+     * topic, and are suitable for sorting or comparing lag across groups.
+     *
+     * Each entry in the response includes:
+     * - groupId: the consumer group identifier
+     * - clusterIdentifier: the cluster this group was observed on
+     * - totalLag: total unconsumed messages across ALL topics this group consumes.
+     *   May be null if offsets could not be determined.
+     * - lagStatus: severity classification of the total lag
+     * - topicLag: the lag for the requested topic only (sum across all partitions of this topic).
+     *   May be null if end offsets could not be fetched.
+     *
+     * When clusterIdentifier is omitted, all registered clusters are queried.
+     *
+     * To find the consumer with the biggest lag on a topic, sort results by topicLag descending.
+     *
+     * @param topicName Topic name to filter by (required)
+     * @param clusterIdentifier Optional cluster identifier to restrict results to a single cluster
+     * @return List of consumer group lag entries for all groups consuming the given topic
+     */
+    @GetMapping("/inspect/consumers/by-topic/lag")
+    fun inspectConsumersByTopicLag(
+        @RequestParam("topicName") topicName: TopicName,
+        @RequestParam("clusterIdentifier", required = false) clusterIdentifier: KafkaClusterIdentifier?
+    ): List<TopicConsumerGroupLag> {
+        val clusterIds = if (clusterIdentifier != null) {
+            listOf(clusterIdentifier)
+        } else {
+            clustersRegistryService.listClusters().map { it.identifier }
+        }
+        return clusterIds.flatMap { clusterId ->
+            consumersService.clusterTopicConsumers(clusterId, topicName).map { group ->
+                val topicMember = group.topicMembers.find { it.topicName == topicName }
+                TopicConsumerGroupLag(
+                    groupId = group.groupId,
+                    clusterIdentifier = clusterId,
+                    totalLag = group.lag.amount,
+                    lagStatus = group.lag.status.name,
+                    topicLag = topicMember?.lag?.amount
+                )
+            }
+        }
+    }
+
+    /**
      * Returns build and version information for all Kafkistry modules.
      *
      * The response contains a list of module build info entries, each including the module name,
@@ -1132,18 +1161,20 @@ class McpApi(
      * cross-cluster aggregations, filtering, and analysis that would otherwise require
      * multiple API calls.
      *
-     * Example queries:
-     * - SELECT name, owner FROM topics WHERE owner = 'my-team'
-     * - SELECT cluster, topic, lag FROM consumer_group_offsets WHERE lag > 10000
-     * - SELECT * FROM topics WHERE partition_count > 100
+     * IMPORTANT — before writing a query, always call:
+     *   GET /sql/table-columns   — full schema (table names, column names, types, keys)
+     *   GET /sql/query-examples  — example queries showing correct join patterns
+     *   GET /sql/table-stats     — row counts to avoid full-scan joins on large tables
      *
-     * The available tables and their schemas can be discovered by querying the SQLite
-     * system tables (e.g., SELECT name FROM sqlite_master WHERE type='table').
+     * Skipping schema discovery is the primary source of wasted queries: table names are
+     * capitalized (e.g., "Topics", not "topics"), join tables use compound FK columns
+     * (e.g., Topics_ActualConfigs.Topic_cluster + Topic_topic), and guessing column names
+     * almost always requires follow-up corrective queries.
      *
      * Only read (SELECT) queries are supported; write operations are not permitted.
      *
      * @param sql SQL SELECT query string
-     * @return Query result as a list of rows, each row being a map of column name to value
+     * @return Query result including columns metadata and rows
      */
     @PostMapping("/sql")
     fun executeSqlQuery(
@@ -1174,7 +1205,138 @@ class McpApi(
     fun inspectTopicDiskUsage(
         @PathVariable topicName: TopicName,
         @PathVariable clusterIdentifier: KafkaClusterIdentifier
-    ) = topicResourcesAnalyzer.topicOnClusterDiskUsage(topicName, clusterIdentifier)
+    ): TopicClusterDiskUsageExt {
+        val result = topicResourcesAnalyzer.topicOnClusterDiskUsage(topicName, clusterIdentifier)
+        val filteredClusterDiskUsage = result.clusterDiskUsage.copy(
+            topicDiskUsages = result.clusterDiskUsage.topicDiskUsages.filterKeys { it == topicName }
+        )
+        return result.copy(clusterDiskUsage = filteredClusterDiskUsage)
+    }
+
+    /**
+     * Returns just the table names in the Kafkistry SQLite metadata database.
+     *
+     * Use this as a lightweight first step to discover which tables exist before
+     * requesting full column details. This is much cheaper than /sql/table-columns
+     * and is useful when you only need to verify a table name or decide which tables
+     * to request column details for.
+     *
+     * Typical workflow:
+     *   1. GET /sql/table-names — discover available tables (cheap)
+     *   2. GET /sql/table-columns?tables=T1,T2 — load columns only for relevant tables
+     *   3. GET /sql/query-examples — find a working example query
+     *   4. POST /sql — run the adapted query
+     *
+     * @return List of all table names in the database
+     */
+    @GetMapping("/sql/table-names")
+    fun getSqlTableNames(): List<String> = sqlRepository.tableNames
+
+    /**
+     * Returns the full schema of the Kafkistry SQLite metadata database — all tables, their columns,
+     * data types, and key relationships.
+     *
+     * ALWAYS call this endpoint before writing any SQL query against /sql. It eliminates the need
+     * for schema-discovery queries (pragma_table_info, sqlite_master scans, guessing table names)
+     * and prevents failures caused by referencing nonexistent tables or wrong column names.
+     *
+     * To reduce response size, pass a comma-separated list of table names via the `tables` parameter
+     * to retrieve columns only for the tables you need. Use /sql/table-names first to discover
+     * available table names, then request only the relevant subset here.
+     *
+     * Each TableInfo entry contains:
+     * - name: the exact table name to use in SQL (e.g., "Topics", "Topics_ActualConfigs", "ConsumerGroups")
+     * - joinTable: true when this table is a many-to-many join/child table (e.g., Topics_Properties,
+     *   Topics_Replicas). Join tables typically reference a parent via composite foreign-key columns
+     *   and should be joined to the parent table to be useful.
+     * - columns: list of ColumnInfo entries, each with:
+     *   - name: exact column name (case-sensitive in SQLite)
+     *   - type: SQL type string (e.g., VARCHAR, INTEGER, BOOLEAN, BIGINT, DOUBLE)
+     *   - primaryKey: true if this column is part of the table's primary key
+     *   - joinKey: true if this column is a foreign-key reference to a parent table
+     *     (use these columns in JOIN conditions)
+     *   - referenceKey: true if this column links to a registry entity that Kafkistry can navigate to
+     *
+     * Foreign-key naming convention: join tables reference their parent via columns named
+     * "{ParentTable}_{columnName}" (e.g., Topics_ActualConfigs references Topics via
+     * "Topic_cluster" + "Topic_topic"). Always inspect joinKey=true columns before joining tables.
+     *
+     * After calling this endpoint, proceed directly to /sql/query-examples to get working
+     * sample queries that demonstrate correct join patterns for common use cases.
+     *
+     * @param tables Optional comma-separated list of table names to filter the response.
+     *               When omitted, all tables are returned.
+     * @return List of tables with their columns, types, and key metadata
+     */
+    @GetMapping("/sql/table-columns")
+    fun getSqlTableColumns(
+        @RequestParam(required = false) tables: String?
+    ): List<TableInfo> {
+        val all = sqlRepository.tableColumns
+        if (tables.isNullOrBlank()) return all
+        val requested = tables.split(",").map { it.trim() }.toSet()
+        return all.filter { it.name in requested }
+    }
+
+    /**
+     * Returns a curated set of example SQL queries for the Kafkistry SQLite metadata database.
+     *
+     * These examples demonstrate correct table names, column names, join patterns, and filter
+     * conditions for the most common analytical use cases. Use them as templates rather than
+     * writing queries from scratch.
+     *
+     * Each QueryExample contains:
+     * - title: a short human-readable description of what the query does (e.g.,
+     *   "Topics with high retention", "Consumer groups with lag > 10000")
+     * - sql: a ready-to-run SQL SELECT statement that can be submitted directly to /sql
+     *   or adapted by changing filter values, adding WHERE clauses, or adjusting projections
+     *
+     * Particular value of these examples:
+     * - Correct join patterns: the compound FK pattern used by join tables
+     *   (e.g., Topics_ActualConfigs.Topic_cluster + Topic_topic joining to Topics) is
+     *   non-obvious from schema alone; examples show the exact join syntax
+     * - Grouping by use case: examples are grouped by domain (disk usage, compression,
+     *   consumer lag, ACL analysis, K2K replication, etc.) making it easy to find a
+     *   starting point for the current task
+     * - Avoiding full-scan pitfalls: examples use indexed columns in WHERE/JOIN conditions,
+     *   reducing the risk of accidentally running unbounded cross-joins on large tables
+     *
+     * Recommended workflow for SQL tasks:
+     *   1. GET /sql/table-columns — load the full schema
+     *   2. GET /sql/query-examples — find the closest matching example
+     *   3. Adapt the example query and POST to /sql to run it
+     *
+     * @return List of titled SQL query examples covering common Kafkistry analytical scenarios
+     */
+    @GetMapping("/sql/query-examples")
+    fun getSqlQueryExamples(): List<QueryExample> = sqlRepository.queryExamples
+
+    /**
+     * Returns the current row counts for all tables in the Kafkistry SQLite metadata database.
+     *
+     * Each TableStats entry contains:
+     * - name: the table name (matches names returned by /sql/table-columns)
+     * - count: the current number of rows in this table, reflecting the most recent
+     *   cluster state scrape
+     *
+     * Use this endpoint to:
+     * - Decide whether to paginate: large tables (count > 10,000) should be queried with
+     *   LIMIT/OFFSET or targeted WHERE clauses rather than SELECT *
+     * - Detect unpopulated tables: a count of 0 on a table like ConsumerGroups indicates
+     *   no consumer groups have been scraped yet (cluster may be unreachable or scraping disabled)
+     * - Prioritize queries: knowing relative table sizes helps avoid accidental cross-joins
+     *   between two large tables (e.g., joining a 50,000-row Topics_Replicas to a 10,000-row
+     *   ConsumerGroupOffsets without a join key would be expensive)
+     * - Confirm data freshness: if table counts look stale or unexpectedly low, check
+     *   /scraping-status to verify that cluster state scraping is running successfully
+     *
+     * Row counts are updated atomically after each full scrape cycle, so they reflect a
+     * consistent snapshot of the most recent data load.
+     *
+     * @return List of table names with their current row counts
+     */
+    @GetMapping("/sql/table-stats")
+    fun getSqlTableStats(): List<TableStats> = sqlRepository.tableStats
 
     /**
      * Generates a suggested registry configuration for importing a topic that exists on a cluster
@@ -1215,8 +1377,7 @@ class McpApi(
 data class RegistryTopicSummary(
     val name: TopicName,
     val owner: String,
-    val presenceType: String,
-    val labels: List<Label>
+    val presenceType: String
 )
 
 /**
@@ -1279,22 +1440,6 @@ data class ClusterConfigurationInfo(
     val sslEnabled: Boolean,
     val saslEnabled: Boolean,
     val profiles: List<String>
-)
-
-/**
- * Minimal topic status summary for scanning.
- * Returned by: GET /inspect/topics/status-summary
- */
-data class TopicStatusSummary(
-    val topicName: TopicName,
-    val overallOk: Boolean,
-    val clusterStatuses: List<ClusterStatusSummary>
-)
-
-data class ClusterStatusSummary(
-    val clusterIdentifier: KafkaClusterIdentifier,
-    val ok: Boolean,
-    val issueCount: Int
 )
 
 /**
@@ -1492,4 +1637,30 @@ data class ConsumerGroupAclInfo(
     val groupId: ConsumerGroupId,
     val clusterIdentifier: KafkaClusterIdentifier,
     val affectingAclRules: List<KafkaAclRule>
+)
+
+/**
+ * Summary of a consumer group consuming a specific topic.
+ * Returned by: GET /inspect/consumers/by-topic
+ */
+data class TopicConsumerGroupSummary(
+    val groupId: ConsumerGroupId,
+    val clusterIdentifier: KafkaClusterIdentifier,
+    val status: String,
+    val lagAmount: Long?,
+    val lagStatus: String,
+    val partitionAssignor: String,
+    val topics: List<TopicName>
+)
+
+/**
+ * Lag info for a consumer group on a specific topic.
+ * Returned by: GET /inspect/consumers/by-topic/lag
+ */
+data class TopicConsumerGroupLag(
+    val groupId: ConsumerGroupId,
+    val clusterIdentifier: KafkaClusterIdentifier,
+    val totalLag: Long?,
+    val lagStatus: String,
+    val topicLag: Long?
 )

@@ -29,6 +29,7 @@ class RollingSQLRepository(
         }
     }
 
+    override val tableNames: List<String> = primary.tableNames
     override val tableColumns: List<TableInfo> = primary.tableColumns
     override val queryExamples: List<QueryExample> = primary.queryExamples
     override val tableStats: List<TableStats> get() = current().tableStats
